@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server"
-import { GoogleGenAI } from "@google/genai"
+import { GoogleGenAI, Modality } from "@google/genai"
 import { createClient as createSupabaseServer } from "@/utils/supabase/server"
 
 export const dynamic = "force-dynamic"
@@ -86,6 +86,9 @@ export async function POST(req: NextRequest) {
 
     const response = await ai.models.generateContent({
       model: "gemini-2.5-flash-image-preview",
+      generationConfig: {
+        responseModalities: [Modality.IMAGE],
+      },
       contents,
     })
 

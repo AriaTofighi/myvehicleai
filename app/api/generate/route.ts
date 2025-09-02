@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server"
-import { GoogleGenAI } from "@google/genai"
+import { GoogleGenAI, Modality } from "@google/genai"
 import { createClient as createSupabaseServer } from "@/utils/supabase/server"
 
 export const dynamic = "force-dynamic"
@@ -56,6 +56,7 @@ export async function POST(req: NextRequest) {
     let prompt = ""
     let mimeType = "image/png"
     let base64Image = ""
+    let overlayImages: Array<{ mimeType: string; data: string }> = []
 
     if (contentType.includes("multipart/form-data")) {
       const form = await req.formData()
@@ -88,13 +89,32 @@ export async function POST(req: NextRequest) {
       } else {
         base64Image = image
       }
+
+      // Optional overlay reference images: array of data URLs or base64 strings
+      const overlays = Array.isArray((json as { overlays?: unknown }).overlays)
+        ? ((json as { overlays: unknown[] }).overlays as unknown[])
+        : []
+      for (const o of overlays) {
+        if (typeof o !== "string") continue
+        const mm = o.match(/^data:(.*?);base64,(.*)$/)
+        if (mm) overlayImages.push({ mimeType: mm[1] || "image/png", data: mm[2] || "" })
+        else overlayImages.push({ mimeType: "image/png", data: o })
+      }
     }
 
     const ai = new GoogleGenAI({ apiKey })
 
     const response = await ai.models.generateContent({
       model: "gemini-2.5-flash-image-preview",
+      generationConfig: {
+        // Nudge API to return an image part, not just text
+        responseModalities: [Modality.IMAGE],
+      },
       contents: [
+        {
+          text:
+            "Edit the provided base image according to the instructions. Return only a single edited image (no text). Use provided reference overlays only as stylistic/content guidance; ignore any background in them.",
+        },
         { text: prompt },
         {
           inlineData: {
@@ -102,6 +122,7 @@ export async function POST(req: NextRequest) {
             data: base64Image,
           },
         },
+        ...overlayImages.map((o) => ({ inlineData: { mimeType: o.mimeType, data: o.data } })),
       ],
     })
 
