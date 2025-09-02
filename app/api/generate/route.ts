@@ -38,7 +38,7 @@ export async function POST(req: NextRequest) {
       if (profile) {
         profileId = profile.id
         prevUpdatedAt = profile.updated_at as unknown as string
-        prevBytesUsed = Number((profile as any).bytes_used || 0)
+        prevBytesUsed = Number((profile as { bytes_used?: number }).bytes_used || 0)
         const last = profile.updated_at ? new Date(profile.updated_at) : null
         const now = new Date()
         const isStale = !last || now.getTime() - last.getTime() > 24 * 60 * 60 * 1000
@@ -108,11 +108,10 @@ export async function POST(req: NextRequest) {
     let outBase64: string | null = null
     let text = ""
     const candidate = response.candidates?.[0]
-    for (const part of candidate?.content?.parts || []) {
-      // @ts-ignore - SDK types expose text/inlineData parts
-      if (part.text) text += part.text
-      // @ts-ignore
-      if (part.inlineData?.data) outBase64 = part.inlineData.data
+    for (const part of (candidate as unknown as { content?: { parts?: Array<{ text?: string; inlineData?: { data?: string } }> } } | undefined)?.content?.parts || []) {
+      if ((part as { text?: string }).text) text += (part as { text?: string }).text || ""
+      const inline = (part as { inlineData?: { data?: string } }).inlineData
+      if (inline?.data) outBase64 = inline.data
     }
 
     if (!outBase64) {
@@ -143,10 +142,10 @@ export async function POST(req: NextRequest) {
     }
 
     return NextResponse.json({ image: outBase64, mimeType: "image/png", text })
-  } catch (err: any) {
+  } catch (err: unknown) {
     console.error("/api/generate error", err)
     return NextResponse.json(
-      { error: err?.message || "Unexpected error" },
+      { error: (err as Error)?.message || "Unexpected error" },
       { status: 500 }
     )
   }

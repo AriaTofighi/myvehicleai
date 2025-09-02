@@ -104,8 +104,8 @@ export function SiteHeader() {
                       })
                       if (error) throw error
                       setEmailSent(true)
-                    } catch (err: any) {
-                      setAuthError(err?.message || "Failed to send sign-in link")
+                    } catch (err: unknown) {
+                      setAuthError((err as Error)?.message || "Failed to send sign-in link")
                     }
                   }}
                 >

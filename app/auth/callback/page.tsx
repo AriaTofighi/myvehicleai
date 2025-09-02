@@ -17,7 +17,7 @@ export default function AuthCallbackPage() {
         await supabase.auth.exchangeCodeForSession(window.location.href).catch(() => {})
         const { data } = await supabase.auth.getUser()
         if (mounted) setStatus(data.user ? "Signed in. Redirecting…" : "No session found")
-      } catch (e) {
+      } catch {
         if (mounted) setStatus("Authentication failed")
       } finally {
         setTimeout(() => router.replace("/"), 600)
@@ -35,4 +35,3 @@ export default function AuthCallbackPage() {
     </div>
   )
 }
-
