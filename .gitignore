@@ -42,3 +42,6 @@ next-env.d.ts
 
 # codex
 .codex/
+
+# supabase
+supabase/.temp/

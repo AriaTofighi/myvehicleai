@@ -1,0 +1,153 @@
+import { NextRequest, NextResponse } from "next/server"
+import { GoogleGenAI } from "@google/genai"
+import { createClient as createSupabaseServer } from "@/utils/supabase/server"
+
+export const dynamic = "force-dynamic"
+
+export async function POST(req: NextRequest) {
+  const apiKey = process.env.GEMINI_API_KEY
+  if (!apiKey) {
+    return NextResponse.json(
+      { error: "Server misconfigured: GEMINI_API_KEY is missing" },
+      { status: 500 }
+    )
+  }
+
+  try {
+    // Auth: require signed-in user for usage tracking and limits
+    const supabase = await createSupabaseServer()
+    const {
+      data: { user },
+    } = await supabase.auth.getUser()
+    if (!user) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+    }
+
+    // Fetch profile for limits
+    const FREE_DAILY_LIMIT = Number(process.env.FREE_DAILY_LIMIT || 25)
+    let dailyCount = 0
+    let profileId: string | null = null
+    let prevUpdatedAt: string | null = null
+    let prevBytesUsed = 0
+    {
+      const { data: profile } = await supabase
+        .from("profiles")
+        .select("id, images_generated, updated_at, bytes_used")
+        .eq("id", user.id)
+        .single()
+      if (profile) {
+        profileId = profile.id
+        prevUpdatedAt = profile.updated_at as unknown as string
+        prevBytesUsed = Number((profile as any).bytes_used || 0)
+        const last = profile.updated_at ? new Date(profile.updated_at) : null
+        const now = new Date()
+        const isStale = !last || now.getTime() - last.getTime() > 24 * 60 * 60 * 1000
+        dailyCount = isStale ? 0 : Number(profile.images_generated || 0)
+        if (dailyCount >= FREE_DAILY_LIMIT) {
+          return NextResponse.json(
+            { error: "Free plan daily limit reached" },
+            { status: 429 }
+          )
+        }
+      }
+    }
+    const contentType = req.headers.get("content-type") || ""
+
+    let prompt = ""
+    let mimeType = "image/png"
+    let base64Image = ""
+
+    if (contentType.includes("multipart/form-data")) {
+      const form = await req.formData()
+      const file = form.get("image")
+      prompt = String(form.get("prompt") || "")
+
+      if (!(file instanceof File)) {
+        return NextResponse.json({ error: "No image uploaded" }, { status: 400 })
+      }
+      if (!prompt) {
+        return NextResponse.json({ error: "Prompt is required" }, { status: 400 })
+      }
+
+      mimeType = file.type || mimeType
+      const buf = Buffer.from(await file.arrayBuffer())
+      base64Image = buf.toString("base64")
+    } else {
+      const json = await req.json().catch(() => null)
+      if (!json) return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 })
+      prompt = String(json.prompt || "")
+      const image = String(json.image || "")
+      if (!prompt || !image) {
+        return NextResponse.json({ error: "Both prompt and image are required" }, { status: 400 })
+      }
+      // Support data URLs or raw base64
+      const match = image.match(/^data:(.*?);base64,(.*)$/)
+      if (match) {
+        mimeType = match[1] || mimeType
+        base64Image = match[2] || ""
+      } else {
+        base64Image = image
+      }
+    }
+
+    const ai = new GoogleGenAI({ apiKey })
+
+    const response = await ai.models.generateContent({
+      model: "gemini-2.5-flash-image-preview",
+      contents: [
+        { text: prompt },
+        {
+          inlineData: {
+            mimeType,
+            data: base64Image,
+          },
+        },
+      ],
+    })
+
+    let outBase64: string | null = null
+    let text = ""
+    const candidate = response.candidates?.[0]
+    for (const part of candidate?.content?.parts || []) {
+      // @ts-ignore - SDK types expose text/inlineData parts
+      if (part.text) text += part.text
+      // @ts-ignore
+      if (part.inlineData?.data) outBase64 = part.inlineData.data
+    }
+
+    if (!outBase64) {
+      return NextResponse.json(
+        { error: "No image returned from model", text },
+        { status: 502 }
+      )
+    }
+
+    // Update usage counters (daily images + bytes)
+    try {
+      const bytesApprox = Math.floor((outBase64.length * 3) / 4)
+      const nowIso = new Date().toISOString()
+      if (profileId) {
+        const reset = prevUpdatedAt
+          ? new Date().getTime() - new Date(prevUpdatedAt).getTime() > 24 * 60 * 60 * 1000
+          : true
+        const newDaily = reset ? 1 : dailyCount + 1
+        const newBytes = prevBytesUsed + bytesApprox
+        await supabase
+          .from("profiles")
+          .update({ images_generated: newDaily, bytes_used: newBytes, updated_at: nowIso })
+          .eq("id", profileId)
+      }
+    } catch (e) {
+      // Non-fatal: log and continue
+      console.error("profiles usage update failed", e)
+    }
+
+    return NextResponse.json({ image: outBase64, mimeType: "image/png", text })
+  } catch (err: any) {
+    console.error("/api/generate error", err)
+    return NextResponse.json(
+      { error: err?.message || "Unexpected error" },
+      { status: 500 }
+    )
+  }
+}
