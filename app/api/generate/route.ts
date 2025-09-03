@@ -53,10 +53,11 @@ export async function POST(req: NextRequest) {
     }
     const contentType = req.headers.get("content-type") || ""
 
-    let prompt = ""
-    let mimeType = "image/png"
-    let base64Image = ""
-    let overlayImages: Array<{ mimeType: string; data: string }> = []
+  let prompt = ""
+  let mimeType = "image/png"
+  let base64Image = ""
+  const overlayImages: Array<{ mimeType: string; data: string }> = []
+  let overlaySpecs: Array<{ index?: number; xNorm?: number; yNorm?: number; xPx?: number; yPx?: number; scale?: number; rotationDeg?: number; z?: number }> = []
 
     if (contentType.includes("multipart/form-data")) {
       const form = await req.formData()
@@ -79,7 +80,10 @@ export async function POST(req: NextRequest) {
       prompt = String(json.prompt || "")
       const image = String(json.image || "")
       if (!prompt || !image) {
-        return NextResponse.json({ error: "Both prompt and image are required" }, { status: 400 })
+        // Allow prompt to be omitted if overlay guidance is provided
+        if (!image) {
+          return NextResponse.json({ error: "Image is required" }, { status: 400 })
+        }
       }
       // Support data URLs or raw base64
       const match = image.match(/^data:(.*?);base64,(.*)$/)
@@ -100,9 +104,40 @@ export async function POST(req: NextRequest) {
         if (mm) overlayImages.push({ mimeType: mm[1] || "image/png", data: mm[2] || "" })
         else overlayImages.push({ mimeType: "image/png", data: o })
       }
+
+      // Optional structured placement metadata
+      const specs = Array.isArray((json as { overlaySpecs?: unknown }).overlaySpecs)
+        ? ((json as { overlaySpecs: unknown[] }).overlaySpecs as unknown[])
+        : []
+      overlaySpecs = specs.filter((s) => typeof s === "object" && s !== null) as typeof overlaySpecs
     }
 
     const ai = new GoogleGenAI({ apiKey })
+
+    // Build concise instructions: if overlay images present, include placement guidance
+    const systemInstrBase = overlayImages.length > 0
+      ? [
+          "You will receive a base vehicle photo and one or more overlay PNGs.",
+          "Seamlessly integrate each overlay into the base at the specified positions and rotations.",
+          "Preserve the original background; align perspective, lighting, reflections and shadows.",
+          "Return only a single edited image (no text).",
+          "Maintain the original canvas/resolution of the base image. Do not crop or add borders.",
+        ].join("\n")
+      : [
+          "Edit the provided base image according to the instructions.",
+          "Return only a single edited image (no text).",
+          "Maintain the original canvas/resolution of the base image. Do not crop or add borders.",
+        ].join("\n")
+
+    // If prompt missing but overlays provided, synthesize a minimal prompt that includes placement JSON
+    if ((!prompt || !prompt.trim()) && overlayImages.length > 0) {
+      const placement = JSON.stringify({ overlays: overlaySpecs }, null, 0)
+      prompt = [
+        "Integrate the overlay images into the base vehicle photo at the specified positions.",
+        "Placement (one per overlay, in order):",
+        placement,
+      ].join("\n")
+    }
 
     const response = await ai.models.generateContent({
       model: "gemini-2.5-flash-image-preview",
@@ -111,18 +146,17 @@ export async function POST(req: NextRequest) {
         responseModalities: [Modality.IMAGE],
       },
       contents: [
-        {
-          text:
-            "Edit the provided base image according to the instructions. Return only a single edited image (no text). Use provided reference overlays only as stylistic/content guidance; ignore any background in them.",
-        },
-        { text: prompt },
-        {
-          inlineData: {
-            mimeType,
-            data: base64Image,
-          },
-        },
+        // Provide overlay assets first, then the base scene, then instructions
         ...overlayImages.map((o) => ({ inlineData: { mimeType: o.mimeType, data: o.data } })),
+        { inlineData: { mimeType, data: base64Image } },
+        {
+          text: [
+            `${systemInstrBase}`,
+            overlaySpecs.length > 0 ? `Placement JSON (normalized and/or pixel centers):\n${JSON.stringify({ overlays: overlaySpecs })}` : "",
+            `The first ${overlayImages.length} image(s) are overlay parts to integrate; the next image is the base scene to edit. Place each overlay once at its specified position.`,
+            String(prompt || "")
+          ].filter(Boolean).join("\n\n"),
+        },
       ],
     })
 

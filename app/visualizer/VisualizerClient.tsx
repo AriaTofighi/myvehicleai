@@ -10,6 +10,7 @@ import { ModsCard } from "./mods-card";
 import { AssetGeneratorCard } from "./asset-generator-card";
 import { AssetLibraryCard } from "./asset-library-card";
 import { SelectedAssetCard } from "./selected-asset-card";
+import { LayersCard } from "./layers-card";
 
 export default function VisualizerClient() {
   const [file, setFile] = useState<File | null>(null)
@@ -31,6 +32,7 @@ export default function VisualizerClient() {
   const [overlays, setOverlays] = useState<OverlayItem[]>([])
   const [selectedOverlayId, setSelectedOverlayId] = useState<string | null>(null)
   const [zoom, setZoom] = useState(1)
+  const [genMode, setGenMode] = useState<"integrate" | "prompt">("integrate")
   const supabase = useMemo(() => createClient(), [])
 
   async function fileToDataUrl(f: File): Promise<string> {
@@ -171,77 +173,115 @@ export default function VisualizerClient() {
     }
   }, [supabase, loadMods, loadAssets])
 
-  async function generateWithPrompt(p: string) {
+  async function integrateOverlays() {
     setError(null)
     setResultBase64(null)
 
-    let promptText = p.trim()
     const overlaysExist = overlays.length > 0
-    if (!promptText && overlaysExist) {
-      const parts = overlays
-        .map((ov) => assets.find((a) => a.id === ov.assetId))
-        .filter(Boolean)
-        .map((a) => `${a!.category}: ${a!.name}`)
-      promptText = `Integrate these cosmetic parts into the car photo realistically (correct perspective, lighting, reflections, shadows, and alignment). Avoid artifacts and keep background unchanged. Parts: ${parts.join(", ")}.`
-      setPrompt(promptText)
+    if (!baseImageDataUrl) {
+      setError("Please upload a base vehicle image")
+      return
     }
-
-    if (!promptText) {
-      setError("Enter a prompt or add assets to auto‑prompt")
+    if (!overlaysExist) {
+      setError("Drag an asset onto the canvas first")
       return
     }
 
     try {
       setLoading(true)
-      let res: Response
-      if (progressive && baseImageDataUrl) {
-        let overlayDataUrls: string[] = []
-        if (overlaysExist) {
-          overlayDataUrls = await Promise.all(
-            overlays.map(async (ov) => {
-              const u = ov.url || assets.find((a) => a.id === ov.assetId)?.signedUrl || null
-              if (!u) return ""
-              try {
-                const b = await fetch(u).then((r) => r.blob())
-                const reader = new FileReader()
-                const dataUrl: string = await new Promise((resolve, reject) => {
-                  reader.onerror = () => reject(new Error("Failed to read overlay"))
-                  reader.onload = () => resolve(String(reader.result))
-                  reader.readAsDataURL(b)
-                })
-                return dataUrl
-              } catch {
-                return ""
-              }
+
+      // Load base image dimensions to compute pixel positions
+      const dims = await new Promise<{ w: number; h: number }>((resolve, reject) => {
+        const img = new Image()
+        img.onload = () => resolve({ w: img.width, h: img.height })
+        img.onerror = () => reject(new Error("Failed to read base image"))
+        img.src = baseImageDataUrl
+      })
+
+      // Collect overlay images and specs
+      let overlayDataUrls: string[] = await Promise.all(
+        overlays.map(async (ov) => {
+          const u = ov.url || assets.find((a) => a.id === ov.assetId)?.signedUrl || null
+          if (!u) return ""
+          try {
+            const b = await fetch(u).then((r) => r.blob())
+            const reader = new FileReader()
+            const dataUrl: string = await new Promise((resolve, reject) => {
+              reader.onerror = () => reject(new Error("Failed to read overlay"))
+              reader.onload = () => resolve(String(reader.result))
+              reader.readAsDataURL(b)
             })
-          )
-          overlayDataUrls = overlayDataUrls.filter((s) => !!s)
-        }
-        res = await fetch("/api/generate", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ prompt: promptText, image: baseImageDataUrl, overlays: overlayDataUrls }),
+            return dataUrl
+          } catch {
+            return ""
+          }
         })
-      } else if (file) {
-        if (file.size > 10 * 1024 * 1024) {
-          setError("Image is too large (max 10MB)")
-          return
-        }
-        const form = new FormData()
-        form.append("prompt", promptText)
-        form.append("image", file)
-        res = await fetch("/api/generate", { method: "POST", body: form })
-      } else {
-        setError("Please upload a base vehicle image")
-        return
-      }
+      )
+      overlayDataUrls = overlayDataUrls.filter((s) => !!s)
+      // Load overlay dimensions
+      const overlayDims = await Promise.all(
+        overlayDataUrls.map(
+          (src) =>
+            new Promise<{ w: number; h: number }>((resolve) => {
+              if (!src) return resolve({ w: 0, h: 0 })
+              const img = new Image()
+              img.onload = () => resolve({ w: img.naturalWidth, h: img.naturalHeight })
+              img.onerror = () => resolve({ w: 0, h: 0 })
+              img.src = src
+            })
+        )
+      )
+
+      const specs = overlays.map((ov, i) => ({
+        index: i + 1,
+        xNorm: Number(ov.x.toFixed(4)),
+        yNorm: Number(ov.y.toFixed(4)),
+        xPx: Math.round(ov.x * dims.w),
+        yPx: Math.round(ov.y * dims.h),
+        scale: Number(ov.scale.toFixed(3)),
+        rotationDeg: Math.round(ov.rotation),
+        z: ov.z,
+        overlayNatural: overlayDims[i] || { w: 0, h: 0 },
+        targetApproxPx: {
+          width: Math.max(1, Math.round((overlayDims[i]?.w || 0) * ov.scale)),
+          height: Math.max(1, Math.round((overlayDims[i]?.h || 0) * ov.scale)),
+        },
+      }))
+
+      const promptText = [
+        "Integrate the provided overlay images into the base vehicle photo at the specified positions.",
+        "Keep the background unchanged. Align perspective, lighting, reflections and shadows.",
+        "Place each overlay centered at the given pixel coordinates with the given rotation and scale.",
+        "Match each overlay's approximate final size in pixels (width/height) when integrating.",
+        "Ignore any padding in overlay images; treat them as transparent PNGs.",
+        "Return only a single edited image (no text).",
+        "Placement (one per overlay, in order):",
+        JSON.stringify({ base: { width: dims.w, height: dims.h }, overlays: specs }),
+      ].join("\n")
+
+      const res = await fetch("/api/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: promptText, image: baseImageDataUrl, overlays: overlayDataUrls, overlaySpecs: specs }),
+      })
 
       const data = await res.json()
       if (!res.ok) throw new Error(data?.error || "Failed to generate image")
-      setResultBase64(data.image)
-      if (progressive && data.image) {
-        setBaseImageDataUrl(`data:image/png;base64,${data.image}`)
+      // Attempt to crop the result back to the base image aspect ratio if it differs
+      if (data.image) {
+        try {
+          const cropped = await cropToAspect(`data:image/png;base64,${data.image}`)
+          const b64 = cropped.replace(/^data:(.*?);base64,/, "").trim()
+          setResultBase64(b64)
+          if (progressive) setBaseImageDataUrl(cropped)
+        } catch {
+          setResultBase64(data.image)
+          if (progressive) setBaseImageDataUrl(`data:image/png;base64,${data.image}`)
+        }
       }
+      // Clear overlays after a successful integration to provide a fresh canvas
+      setOverlays([])
+      setSelectedOverlayId(null)
     } catch (err: unknown) {
       setError((err as Error)?.message || "Failed to generate image")
     } finally {
@@ -249,9 +289,110 @@ export default function VisualizerClient() {
     }
   }
 
-  async function onGenerate(e: React.FormEvent) {
-    e.preventDefault()
-    await generateWithPrompt(prompt)
+  async function generateFromText() {
+    setError(null)
+    setResultBase64(null)
+    const p = prompt.trim()
+    if (!p) {
+      setError("Enter a prompt")
+      return
+    }
+    if (!baseImageDataUrl) {
+      setError("Please upload a base vehicle image")
+      return
+    }
+    try {
+      setLoading(true)
+      let overlayDataUrls: string[] = []
+      if (overlays.length > 0) {
+        overlayDataUrls = await Promise.all(
+          overlays.map(async (ov) => {
+            const u = ov.url || assets.find((a) => a.id === ov.assetId)?.signedUrl || null
+            if (!u) return ""
+            try {
+              const b = await fetch(u).then((r) => r.blob())
+              const reader = new FileReader()
+              const dataUrl: string = await new Promise((resolve, reject) => {
+                reader.onerror = () => reject(new Error("Failed to read overlay"))
+                reader.onload = () => resolve(String(reader.result))
+                reader.readAsDataURL(b)
+              })
+              return dataUrl
+            } catch {
+              return ""
+            }
+          })
+        )
+        overlayDataUrls = overlayDataUrls.filter((s) => !!s)
+      }
+      const res = await fetch("/api/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: p, image: baseImageDataUrl, overlays: overlayDataUrls }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data?.error || "Failed to generate image")
+      if (data.image) {
+        try {
+          const cropped = await cropToAspect(`data:image/png;base64,${data.image}`)
+          const b64 = cropped.replace(/^data:(.*?);base64,/, "").trim()
+          setResultBase64(b64)
+          if (progressive) setBaseImageDataUrl(cropped)
+        } catch {
+          setResultBase64(data.image)
+          if (progressive) setBaseImageDataUrl(`data:image/png;base64,${data.image}`)
+        }
+      }
+      // Keep overlays for text-based generation; only clear on explicit integrate
+    } catch (err: unknown) {
+      setError((err as Error)?.message || "Failed to generate image")
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function cropToAspect(resultDataUrl: string): Promise<string> {
+    // Crop the result to the base image's aspect ratio, centered
+    const baseDims = await new Promise<{ w: number; h: number }>((resolve, reject) => {
+      if (!baseImageDataUrl) return reject(new Error("No base image"))
+      const img = new Image()
+      img.onload = () => resolve({ w: img.naturalWidth, h: img.naturalHeight })
+      img.onerror = () => reject(new Error("Failed to read base image"))
+      img.src = baseImageDataUrl
+    })
+
+    return new Promise((resolve, reject) => {
+      const out = new Image()
+      out.onload = () => {
+        const baseAR = baseDims.w / baseDims.h
+        const outAR = out.naturalWidth / out.naturalHeight
+        let sx = 0, sy = 0, sw = out.naturalWidth, sh = out.naturalHeight
+        if (Math.abs(outAR - baseAR) > 0.001) {
+          if (outAR > baseAR) {
+            // wider than target; crop width
+            sh = out.naturalHeight
+            sw = Math.round(sh * baseAR)
+            sx = Math.round((out.naturalWidth - sw) / 2)
+            sy = 0
+          } else {
+            // taller than target; crop height
+            sw = out.naturalWidth
+            sh = Math.round(sw / baseAR)
+            sx = 0
+            sy = Math.round((out.naturalHeight - sh) / 2)
+          }
+        }
+        const canvas = document.createElement("canvas")
+        canvas.width = baseDims.w
+        canvas.height = baseDims.h
+        const ctx = canvas.getContext("2d")
+        if (!ctx) return reject(new Error("Could not get canvas context"))
+        ctx.drawImage(out, sx, sy, sw, sh, 0, 0, baseDims.w, baseDims.h)
+        resolve(canvas.toDataURL("image/png"))
+      }
+      out.onerror = () => reject(new Error("Failed to read output image"))
+      out.src = resultDataUrl
+    })
   }
 
   async function saveCurrentAsMod() {
@@ -266,10 +407,6 @@ export default function VisualizerClient() {
       return
     }
     const name = modName.trim() || "Untitled Mod"
-    if (!prompt.trim()) {
-      setError("Enter a prompt to save as a mod")
-      return
-    }
     try {
       setLoading(true)
       const blob = await (await fetch(snapshot)).blob()
@@ -286,9 +423,14 @@ export default function VisualizerClient() {
         img.src = URL.createObjectURL(blob)
       })
 
+      const autoPrompt = prompt.trim() || (() => {
+        const count = overlays.length
+        return `Auto: integrate ${count} overlay${count === 1 ? "" : "s"} at placed positions`
+      })()
+
       const ins = await supabase
         .from("mods")
-        .insert({ user_id: userId, name, prompt, image_path: path, width: dims.w, height: dims.h })
+        .insert({ user_id: userId, name, prompt: autoPrompt, image_path: path, width: dims.w, height: dims.h })
         .select()
         .single()
       if (ins.error) throw ins.error
@@ -344,9 +486,7 @@ export default function VisualizerClient() {
       <div>
         <h1 className="text-3xl font-semibold tracking-tight">Visualizer</h1>
         <p className="text-muted-foreground mt-1 max-w-2xl">
-          Upload a base photo, describe the cosmetic changes, and generate an
-          edited preview with Gemini 2.5 Flash. This is a minimal editing flow
-          for now.
+          Upload a base photo, drag and place cosmetic parts on the canvas, and integrate them into the image with Gemini 2.5 Flash.
         </p>
       </div>
 
@@ -372,11 +512,15 @@ export default function VisualizerClient() {
           />
 
           <GenerationCard
+            mode={genMode}
+            setMode={setGenMode}
             prompt={prompt}
             setPrompt={setPrompt}
-            onGenerate={onGenerate}
+            onIntegrate={integrateOverlays}
+            onGenerateText={generateFromText}
             loading={loading}
             error={error}
+            disabled={!baseImageDataUrl || overlays.length === 0}
           />
 
           <ModsCard
@@ -384,8 +528,8 @@ export default function VisualizerClient() {
             setModName={setModName}
             mods={mods}
             onSaveMod={saveCurrentAsMod}
-            onLoadPrompt={(p) => setPrompt(p)}
-            onGenerateFromPrompt={(p) => { setPrompt(p); generateWithPrompt(p) }}
+            onLoadPrompt={(p) => { setGenMode("prompt"); setPrompt(p) }}
+            onGenerateFromPrompt={async (p) => { setGenMode("prompt"); setPrompt(p); await generateFromText() }}
             onUseAsBase={async (m) => {
               if (m.signedUrl) {
                 const dataUrl = await urlToDataUrl(m.signedUrl)
@@ -434,6 +578,14 @@ export default function VisualizerClient() {
             }}
           />
 
+          <LayersCard
+            overlays={overlays}
+            setOverlays={setOverlays}
+            assets={assets}
+            selectedOverlayId={selectedOverlayId}
+            setSelectedOverlayId={setSelectedOverlayId}
+          />
+
           {selectedOverlay ? (
             <SelectedAssetCard
               overlays={overlays}
@@ -448,4 +600,3 @@ export default function VisualizerClient() {
     </div>
   )
 }
-

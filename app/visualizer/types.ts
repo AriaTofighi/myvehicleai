@@ -32,5 +32,5 @@ export type OverlayItem = {
   scale: number // 0.1..3
   rotation: number // degrees
   z: number
+  hidden?: boolean
 }
-

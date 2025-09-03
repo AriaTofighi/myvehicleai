@@ -29,8 +29,7 @@ export default function Home() {
           </CardHeader>
           <CardContent>
             <p className="text-sm text-muted-foreground">
-              Upload, arrange cosmetic mods, and preview results. Drag-and-drop and AI
-              integration will be added in a future phase.
+              Upload, arrange cosmetic mods, and preview results. Drag-and-drop with AI integration lets you place parts and blend them into your photo.
             </p>
           </CardContent>
         </Card>

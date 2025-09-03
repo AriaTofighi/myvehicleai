@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { Button } from "@/components/ui/button"
 import {
   Card,
@@ -40,6 +40,7 @@ export function VisualizerCanvas(props: Props) {
 
   const canvasRef = useRef<HTMLDivElement | null>(null)
   const contentRef = useRef<HTMLDivElement | null>(null)
+  const [imgDims, setImgDims] = useState<{ w: number; h: number } | null>(null)
   const dragStateRef = useRef<{
     id: string | null
     startX: number
@@ -255,7 +256,8 @@ export function VisualizerCanvas(props: Props) {
         </div>
         <div
           ref={canvasRef}
-          className="aspect-video w-full rounded-lg border bg-muted/30 relative overflow-hidden"
+          className="w-full rounded-lg border bg-muted/30 relative overflow-hidden"
+          style={{ aspectRatio: imgDims ? `${imgDims.w} / ${imgDims.h}` : undefined }}
           onDrop={onCanvasDrop}
           onDragOver={onCanvasDragOver}
           onWheel={onCanvasWheel}
@@ -271,6 +273,10 @@ export function VisualizerCanvas(props: Props) {
                 src={canvasImageSrc}
                 alt="Canvas preview"
                 className="absolute inset-0 h-full w-full object-contain select-none pointer-events-none"
+                onLoad={(e) => {
+                  const el = e.currentTarget
+                  setImgDims({ w: el.naturalWidth, h: el.naturalHeight })
+                }}
               />
             ) : (
               <div className="absolute inset-0 grid place-items-center">
@@ -280,7 +286,7 @@ export function VisualizerCanvas(props: Props) {
               </div>
             )}
 
-            {overlays.map((o) => (
+            {overlays.filter((o) => !o.hidden).map((o) => (
               <div
                 key={o.id}
                 className="absolute"
@@ -378,4 +384,3 @@ export function VisualizerCanvas(props: Props) {
     </Card>
   )
 }
-
